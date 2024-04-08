@@ -1,71 +1,129 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
-	"io"
+	"bytes"
+	"demo_news/news"
+	"html/template"
+	"log"
+	"math"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
-type Article struct {
-	Source struct {
-		ID   interface{} `json:"id"`
-		Name string      `json:"name"`
-	} `json:"source"`
-	Author      string    `json:"author"`
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
-	URL         string    `json:"url"`
-	URLToImage  string    `json:"urlToImage"`
-	PublishedAt time.Time `json:"publishedAt"`
-	Content     string    `json:"content"`
+var tpl = template.Must(template.ParseFiles("index.html"))
+
+type Search struct {
+	Query      string
+	NextPage   int
+	TotalPages int
+	Results    *news.Results
 }
 
-func (a *Article) FormatPublishedDate() string {
-	year, month, day := a.PublishedAt.Date()
-	return fmt.Sprintf("%v %d, %d", month, day, year)
+func (s *Search) IsLastPage() bool {
+	return s.NextPage >= s.TotalPages
 }
 
-type Results struct {
-	Status       string    `json:"status"`
-	TotalResults int       `json:"totalResults"`
-	Articles     []Article `json:"articles"`
+func (s *Search) CurrentPage() int {
+	if s.NextPage == 1 {
+		return s.NextPage
+	}
+
+	return s.NextPage - 1
 }
 
-type Client struct {
-	http     *http.Client
-	key      string
-	PageSize int
+func (s *Search) PreviousPage() int {
+	return s.CurrentPage() - 1
 }
 
-func (c *Client) FetchEverything(query, page string) (*Results, error) {
-	endpoint := fmt.Sprintf("https://newsapi.org/v2/everything?q=%s&pageSize=%d&page=%s&apiKey=%s&sortBy=publishedAt&language=en", url.QueryEscape(query), c.PageSize, page, c.key)
-	resp, err := c.http.Get(endpoint)
+func indexHandler(w http.ResponseWriter, r *http.Request) {
+	buf := &bytes.Buffer{}
+	err := tpl.Execute(buf, nil)
 	if err != nil {
-		return nil, err
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf(string(body))
-	}
-
-	res := &Results{}
-	return res, json.Unmarshal(body, res)
+	buf.WriteTo(w)
 }
 
-func NewClient(httpClient *http.Client, key string, pageSize int) *Client {
-	if pageSize > 100 {
-		pageSize = 100
+func searchHandler(newsapi *news.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		u, err := url.Parse(r.URL.String())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		params := u.Query()
+		searchQuery := params.Get("q")
+		page := params.Get("page")
+		if page == "" {
+			page = "1"
+		}
+
+		results, err := newsapi.FetchEverything(searchQuery, page)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		nextPage, err := strconv.Atoi(page)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		search := &Search{
+			Query:      searchQuery,
+			NextPage:   nextPage,
+			TotalPages: int(math.Ceil(float64(results.TotalResults) / float64(newsapi.PageSize))),
+			Results:    results,
+		}
+
+		if ok := !search.IsLastPage(); ok {
+			search.NextPage++
+		}
+
+		buf := &bytes.Buffer{}
+		err = tpl.Execute(buf, search)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		buf.WriteTo(w)
+	}
+}
+
+func main() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("Error loading .env file")
 	}
 
-	return &Client{httpClient, key, pageSize}
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+
+	apiKey := os.Getenv("NEWS_API_KEY")
+	if apiKey == "" {
+		log.Fatal("Env: apiKey must be set")
+	}
+
+	myClient := &http.Client{Timeout: 10 * time.Second}
+	newsapi := news.NewClient(myClient, apiKey, 20)
+
+	fs := http.FileServer(http.Dir("assets"))
+
+	mux := http.NewServeMux()
+	mux.Handle("/assets/", http.StripPrefix("/assets/", fs))
+	mux.HandleFunc("/search", searchHandler(newsapi))
+	mux.HandleFunc("/", indexHandler)
+	http.ListenAndServe(":"+port, mux)
 }
