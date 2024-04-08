@@ -1,11 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"html/template"
+	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"time"
 )
 
@@ -23,44 +23,49 @@ type Article struct {
 	Content     string    `json:"content"`
 }
 
-var tpl = template.Must(template.ParseFiles("index.html"))
-
-func indexHandler(w http.ResponseWriter, r *http.Request) {
-	tpl.Execute(w, nil)
+func (a *Article) FormatPublishedDate() string {
+	year, month, day := a.PublishedAt.Date()
+	return fmt.Sprintf("%v %d, %d", month, day, year)
 }
 
-func searchHandler(w http.ResponseWriter, r *http.Request) {
-	u, err := url.Parse(r.URL.String())
+type Results struct {
+	Status       string    `json:"status"`
+	TotalResults int       `json:"totalResults"`
+	Articles     []Article `json:"articles"`
+}
+
+type Client struct {
+	http     *http.Client
+	key      string
+	PageSize int
+}
+
+func (c *Client) FetchEverything(query, page string) (*Results, error) {
+	endpoint := fmt.Sprintf("https://newsapi.org/v2/everything?q=%s&pageSize=%d&page=%s&apiKey=%s&sortBy=publishedAt&language=en", url.QueryEscape(query), c.PageSize, page, c.key)
+	resp, err := c.http.Get(endpoint)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("Internal server error"))
-		return
+		return nil, err
 	}
 
-	params := u.Query()
-	searchKey := params.Get("q")
-	page := params.Get("page")
-	if page == "" {
-		page = "1"
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
 
-	fmt.Println("Search Query is: ", searchKey)
-	fmt.Println("Results page is: ", page)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf(string(body))
+	}
+
+	res := &Results{}
+	return res, json.Unmarshal(body, res)
 }
 
-func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "3000"
+func NewClient(httpClient *http.Client, key string, pageSize int) *Client {
+	if pageSize > 100 {
+		pageSize = 100
 	}
 
-	mux := http.NewServeMux()
-
-	fs := http.FileServer(http.Dir("assets"))
-	mux.Handle("/assets/", http.StripPrefix("/assets/", fs))
-
-	// Add the next line
-	mux.HandleFunc("/search", searchHandler)
-	mux.HandleFunc("/", indexHandler)
-	http.ListenAndServe(":"+port, mux)
+	return &Client{httpClient, key, pageSize}
 }
